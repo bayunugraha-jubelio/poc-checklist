@@ -1,15 +1,36 @@
-name: "💡 [INFO ONLY] Checklist Tracker"
+# =============================================================================
+# PR Checklist Tracker (menggunakan marketplace action, tanpa script custom)
+# -----------------------------------------------------------------------------
+# Otomatis menambahkan label tracking ke PR berdasarkan status checklist.
+# TIDAK memblokir merge — hanya label informatif.
+# =============================================================================
+
+name: PR Checklist Tracker
 
 on:
   pull_request:
-    types: [opened, edited]
+    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
 
 jobs:
-  check-tasks:
+  track-checklist:
+    name: Track Checklist
     runs-on: ubuntu-latest
     steps:
-      - name: Verify Checklist Completion
-        uses: seaduboi/todo-checker-action@v1
+      - name: Check PR Checklist
+        uses: preda-bogdan/gha-pr-check-helper@master
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # false = tidak gagalkan workflow jika PR tidak punya checklist
+          requireChecklist: false
 
+          # Hanya periksa body PR (bukan komentar)
+          onlyCheckBody: true
+
+          # Label yang ditambahkan otomatis
+          completedLabel: "checklist-completed"
+          incompleteLabel: "checklist-incomplete"
+
+          # Tambahkan label ini ke PR untuk skip pengecekan
+          skipLabel: "allow-checklist-skip"
+
+          # Izinkan item yang di-strikethrough dianggap selesai
+          allowStrikeThrough: true
