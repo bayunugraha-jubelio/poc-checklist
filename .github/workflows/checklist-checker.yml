@@ -1,5 +1,5 @@
 # =============================================================================
-# PR Checklist History (console log only)
+# PR Checklist History — flat comment version
 # =============================================================================
 
 name: PR Checklist History
@@ -9,7 +9,7 @@ on:
     types: [opened, edited, synchronize, reopened]
 
 permissions:
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   track-checklist:
@@ -20,6 +20,8 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
+            const MARKER = '<!-- checklist-history -->';
+
             function parseChecklist(body) {
               if (!body) return [];
               const items = [];
@@ -30,54 +32,84 @@ jobs:
               return items;
             }
 
-            const currentItems = parseChecklist(context.payload.pull_request.body);
-            const previousItems = parseChecklist(context.payload.changes?.body?.from ?? '');
+            const current = parseChecklist(context.payload.pull_request.body);
+            const previous = parseChecklist(context.payload.changes?.body?.from ?? '');
             const actor = context.payload.sender?.login || 'unknown';
-            const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
-            const pr = context.payload.pull_request.number;
+            const ts = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
 
-            if (currentItems.length === 0) {
-              console.log(`[${timestamp}] PR #${pr} — no checklist found`);
-              return;
-            }
+            if (current.length === 0) return;
 
-            const prevMap = new Map(previousItems.map(i => [i.label, i.checked]));
+            // ── Detect changes ────────────────────────────────────────
+            const prevMap = new Map(previous.map(i => [i.label, i.checked]));
+            const lines = [];
 
-            // On opened/reopened or no previous body — log initial state
             if (!context.payload.changes?.body) {
-              console.log(`[${timestamp}] PR #${pr} | user: ${actor} | event: ${context.payload.action}`);
-              for (const item of currentItems) {
-                console.log(`  ${item.checked ? '✅' : '⬜'} ${item.label}`);
+              // First time (opened/reopened) — log initial state
+              for (const item of current) {
+                lines.push(`| ${ts} | @${actor} | ${item.checked ? '✅' : '⬜'} | ${item.label} |`);
               }
-              const checked = currentItems.filter(i => i.checked).length;
-              console.log(`  progress: ${checked}/${currentItems.length}`);
-              return;
-            }
-
-            // Detect changes
-            const changes = [];
-
-            for (const item of currentItems) {
-              const was = prevMap.get(item.label);
-              if (was === undefined) {
-                changes.push(`  ➕ added (${item.checked ? 'checked' : 'unchecked'}): ${item.label}`);
-              } else if (was !== item.checked) {
-                changes.push(`  ${item.checked ? '⬜ → ✅' : '✅ → ⬜'} ${item.label}`);
-              }
-            }
-
-            for (const item of previousItems) {
-              if (!currentItems.some(c => c.label === item.label)) {
-                changes.push(`  🗑️ removed: ${item.label}`);
-              }
-            }
-
-            const checked = currentItems.filter(i => i.checked).length;
-
-            console.log(`[${timestamp}] PR #${pr} | user: ${actor} | progress: ${checked}/${currentItems.length}`);
-
-            if (changes.length > 0) {
-              for (const c of changes) console.log(c);
             } else {
-              console.log('  no checklist changes');
+              for (const item of current) {
+                const was = prevMap.get(item.label);
+                if (was === undefined) {
+                  lines.push(`| ${ts} | @${actor} | ➕ ${item.checked ? '✅' : '⬜'} | ${item.label} |`);
+                } else if (was !== item.checked) {
+                  lines.push(`| ${ts} | @${actor} | ${item.checked ? '✅' : '⬜'} | ${item.label} |`);
+                }
+              }
+              for (const item of previous) {
+                if (!current.some(c => c.label === item.label)) {
+                  lines.push(`| ${ts} | @${actor} | 🗑️ | ~~${item.label}~~ |`);
+                }
+              }
+            }
+
+            if (lines.length === 0) return;
+
+            // ── Find existing comment ─────────────────────────────────
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100
+            });
+
+            const existing = comments.find(c => c.body.includes(MARKER));
+
+            // ── Parse previous rows ───────────────────────────────────
+            let rows = [];
+            if (existing) {
+              const m = existing.body.match(/<!-- rows -->([\s\S]*?)<!-- \/rows -->/);
+              if (m) {
+                rows = m[1].trim().split('\n').filter(l => l.startsWith('|'));
+              }
+            }
+
+            rows.push(...lines);
+            if (rows.length > 100) rows = rows.slice(-100);
+
+            // ── Build comment ─────────────────────────────────────────
+            const checked = current.filter(i => i.checked).length;
+
+            const body = [
+              MARKER,
+              `**Checklist** — ${checked}/${current.length}`,
+              '',
+              '| Timestamp | User | Status | Item |',
+              '|-----------|------|--------|------|',
+              '<!-- rows -->',
+              rows.join('\n'),
+              '<!-- /rows -->'
+            ].join('\n');
+
+            // ── Post or update ────────────────────────────────────────
+            const params = {
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            };
+
+            if (existing) {
+              await github.rest.issues.updateComment({ ...params, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...params, issue_number: context.payload.pull_request.number, body });
             }
