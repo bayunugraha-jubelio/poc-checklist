@@ -1,36 +1,205 @@
 # =============================================================================
-# PR Checklist Tracker (menggunakan marketplace action, tanpa script custom)
+# PR Checklist Tracker
 # -----------------------------------------------------------------------------
-# Otomatis menambahkan label tracking ke PR berdasarkan status checklist.
-# TIDAK memblokir merge — hanya label informatif.
+# Tracks checklist completion in PR descriptions and maintains a history log.
+# Informational only — does NOT block merges.
 # =============================================================================
 
 name: PR Checklist Tracker
 
 on:
   pull_request:
-    types: [opened, edited, synchronize, reopened, labeled, unlabeled]
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: write
 
 jobs:
   track-checklist:
-    name: Track Checklist
+    name: Track Checklist Progress
     runs-on: ubuntu-latest
+
     steps:
-      - name: Check PR Checklist
-        uses: preda-bogdan/gha-pr-check-helper@master
+      - name: Track PR Checklist
+        uses: actions/github-script@v7
         with:
-          # false = tidak gagalkan workflow jika PR tidak punya checklist
-          requireChecklist: false
+          script: |
+            const COMMENT_MARKER = '<!-- pr-checklist-tracker -->';
 
-          # Hanya periksa body PR (bukan komentar)
-          onlyCheckBody: true
+            // ── 1. Parse checklist items from PR body ──────────────────────
+            const prBody = context.payload.pull_request.body || '';
+            const lines = prBody.split('\n');
 
-          # Label yang ditambahkan otomatis
-          completedLabel: "checklist-completed"
-          incompleteLabel: "checklist-incomplete"
+            const items = [];
+            let currentSection = null;
 
-          # Tambahkan label ini ke PR untuk skip pengecekan
-          skipLabel: "allow-checklist-skip"
+            for (const line of lines) {
+              // Detect markdown headings as section names
+              const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
+              if (headingMatch) {
+                currentSection = headingMatch[2].trim();
+              }
 
-          # Izinkan item yang di-strikethrough dianggap selesai
-          allowStrikeThrough: true
+              // Detect checklist items: - [ ] or - [x] or - [X]
+              const checkMatch = line.match(/^[\s]*-\s+\[([ xX])\]\s+(.*)/);
+              if (checkMatch) {
+                items.push({
+                  checked: checkMatch[1].toLowerCase() === 'x',
+                  label: checkMatch[2].trim(),
+                  section: currentSection
+                });
+              }
+            }
+
+            // If no checklist found, skip silently
+            if (items.length === 0) {
+              console.log('No checklist items found in PR body. Skipping.');
+              return;
+            }
+
+            // ── 2. Calculate stats ─────────────────────────────────────────
+            const total = items.length;
+            const checked = items.filter(i => i.checked).length;
+            const unchecked = total - checked;
+            const percent = Math.round((checked / total) * 100);
+
+            // Progress bar
+            const barLength = 20;
+            const filled = Math.round((percent / 100) * barLength);
+            const progressBar = '█'.repeat(filled) + '░'.repeat(barLength - filled);
+
+            // ── 3. Find existing tracker comment ───────────────────────────
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              per_page: 100
+            });
+
+            const existing = comments.find(c => c.body.includes(COMMENT_MARKER));
+
+            // ── 4. Parse previous history from existing comment ────────────
+            let history = [];
+            if (existing) {
+              const historyMatch = existing.body.match(
+                /<!-- history-start -->([\s\S]*?)<!-- history-end -->/
+              );
+              if (historyMatch) {
+                history = historyMatch[1]
+                  .trim()
+                  .split('\n')
+                  .filter(l => l.startsWith('| '));
+                // Remove table header rows if present
+                history = history.filter(l => !l.includes('---'));
+                // Keep only data rows (skip header)
+                if (history.length > 0 && history[0].includes('Timestamp')) {
+                  history.shift();
+                }
+              }
+            }
+
+            // ── 5. Build new history entry ─────────────────────────────────
+            const now = new Date();
+            const timestamp = now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+            const eventType = context.payload.action === 'opened'
+              ? '🆕 Opened'
+              : context.payload.action === 'synchronize'
+                ? '🔄 Push'
+                : '✏️ Edited';
+
+            const newEntry = `| ${timestamp} | ${eventType} | ${checked}/${total} | ${percent}% |`;
+            history.push(newEntry);
+
+            // Keep last 50 entries to avoid comment size issues
+            if (history.length > 50) {
+              history = history.slice(-50);
+            }
+
+            // ── 6. Build section breakdown ─────────────────────────────────
+            const sections = {};
+            for (const item of items) {
+              const sec = item.section || 'General';
+              if (!sections[sec]) sections[sec] = { checked: 0, total: 0, items: [] };
+              sections[sec].total++;
+              if (item.checked) sections[sec].checked++;
+              sections[sec].items.push(item);
+            }
+
+            let sectionBreakdown = '';
+            for (const [secName, sec] of Object.entries(sections)) {
+              const secPercent = Math.round((sec.checked / sec.total) * 100);
+              const secIcon = secPercent === 100 ? '✅' : secPercent > 0 ? '🔶' : '⬜';
+              sectionBreakdown += `\n${secIcon} **${secName}** — ${sec.checked}/${sec.total} (${secPercent}%)\n`;
+              for (const item of sec.items) {
+                sectionBreakdown += `${item.checked ? '  - ✅' : '  - ⬜'} ${item.label}\n`;
+              }
+            }
+
+            // ── 7. Build status icon ───────────────────────────────────────
+            let statusIcon, statusLabel;
+            if (percent === 100) {
+              statusIcon = '✅';
+              statusLabel = 'All items completed!';
+            } else if (percent >= 75) {
+              statusIcon = '🟢';
+              statusLabel = 'Almost there!';
+            } else if (percent >= 50) {
+              statusIcon = '🟡';
+              statusLabel = 'Halfway through';
+            } else if (percent > 0) {
+              statusIcon = '🟠';
+              statusLabel = 'In progress';
+            } else {
+              statusIcon = '🔴';
+              statusLabel = 'Not started';
+            }
+
+            // ── 8. Compose the comment body ────────────────────────────────
+            const historyTable = history.length > 0
+              ? history.join('\n')
+              : '| — | — | — | — |';
+
+            const body = `${COMMENT_MARKER}
+            ## ${statusIcon} PR Checklist Tracker
+
+            \`${progressBar}\` **${percent}%** — ${checked}/${total} items completed
+
+            > **Status:** ${statusLabel}
+
+            ---
+
+            ### 📋 Breakdown
+            ${sectionBreakdown}
+            ---
+
+            ### 📜 History
+
+            | Timestamp | Event | Progress | % |
+            |-----------|-------|----------|---|
+            <!-- history-start -->
+            ${historyTable}
+            <!-- history-end -->
+
+            ---
+            <sub>🤖 Updated automatically by PR Checklist Tracker · ${timestamp}</sub>
+            `.replace(/^            /gm, '');
+
+            // ── 9. Create or update comment ────────────────────────────────
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body
+              });
+              console.log(`Updated checklist tracker comment (${checked}/${total})`);
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body
+              });
+              console.log(`Created checklist tracker comment (${checked}/${total})`);
+            }
+
