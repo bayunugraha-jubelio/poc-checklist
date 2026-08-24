@@ -97,9 +97,7 @@ jobs:
               '',
               '| Timestamp | User | Status | Item |',
               '|-----------|------|--------|------|',
-              '<!-- rows -->',
-              rows.join('\n'),
-              '<!-- /rows -->'
+              rows.join('\n')
             ].join('\n');
 
             // ── Post or update ────────────────────────────────────────
